@@ -1,0 +1,19 @@
+{
+  "name": "headroom-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "migrate": "node migrate.js"
+  },
+  "dependencies": {
+    "headroom": "file:../linear-dashboard",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.7",
+    "express-session": "^1.18.1",
+    "pg": "^8.13.1",
+    "stripe": "^17.7.0"
+  }
+}
