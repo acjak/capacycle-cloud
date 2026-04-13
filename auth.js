@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import * as tenantDb from "./tenant-db.js";
+import { notifyNewTenant, notifyNewUser } from "./notify.js";
 
 const {
   LINEAR_CLIENT_ID,
@@ -96,6 +97,13 @@ router.get("/auth/callback", async (req, res) => {
     // Store in session
     req.session.userId = user.id;
     req.session.tenantId = tenant.id;
+
+    // Notify
+    if (tenant.isNew) {
+      notifyNewTenant(org.name, viewer.name, viewer.email);
+    } else {
+      notifyNewUser(org.name, viewer.name, viewer.email);
+    }
 
     res.redirect(APP_URL);
   } catch (err) {

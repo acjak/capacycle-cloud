@@ -1,6 +1,7 @@
 import express from "express";
 import Stripe from "stripe";
 import * as tenantDb from "./tenant-db.js";
+import { notifyPayment, notifyChurn } from "./notify.js";
 
 const {
   STRIPE_SECRET_KEY,
@@ -187,6 +188,10 @@ router.post("/api/billing/webhook",
               plan,
             }, null);
           }
+          // Notify
+          const tenant = await tenantDb.getTenant(tenantId);
+          const planInfo = PLANS[plan];
+          notifyPayment(tenant?.name || tenantId, plan, planInfo?.amount || 0);
         }
         break;
       }
@@ -200,12 +205,18 @@ router.post("/api/billing/webhook",
           [customerId]
         );
         if (rows[0]) {
+          const newStatus = subscription.status === "active" ? "active"
+            : subscription.status === "trialing" ? "trialing"
+            : "canceled";
           await tenantDb.updateSubscription(rows[0].tenant_id, {
-            status: subscription.status === "active" ? "active"
-              : subscription.status === "trialing" ? "trialing"
-              : "canceled",
+            status: newStatus,
             current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
           });
+          // Notify on cancellation
+          if (newStatus === "canceled") {
+            const tenant = await tenantDb.getTenant(rows[0].tenant_id);
+            notifyChurn(tenant?.name || rows[0].tenant_id);
+          }
         }
         break;
       }

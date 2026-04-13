@@ -64,6 +64,8 @@ const { server, app } = createApp({
       });
       app.use((req, res, next) => {
         if (req.path === "/gate" || req.path.startsWith("/api/webhooks/") || req.path === "/api/billing/webhook") return next();
+        // Allow crawlers to access SEO files
+        if (req.path === "/robots.txt" || req.path === "/sitemap.xml") return next();
         if (req.cookies?.gate === launchCode) return next();
         res.send(gatePage());
       });
@@ -168,8 +170,11 @@ ${error ? `<div class="err">${error}</div>` : ""}
   },
 });
 
+import { notifyError } from "./notify.js";
+
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", err);
+  notifyError("Unhandled rejection", err);
 });
 
 server.listen(PORT, () => {
