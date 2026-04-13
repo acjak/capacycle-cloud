@@ -142,6 +142,7 @@ router.post("/api/billing/webhook",
 export function requireActiveSubscription(req, res, next) {
   if (req.path.startsWith("/auth/")) return next();
   if (req.path.startsWith("/api/billing/")) return next();
+  if (req.path.startsWith("/api/webhooks/")) return next();
   if (!req.path.startsWith("/api/")) return next();
 
   // Check subscription asynchronously

@@ -5,10 +5,6 @@
 app = "cyclec-cloud"
 primary_region = "arn"
 
-[build]
-  # Deploy from parent dir: fly deploy --config cyclec-cloud/fly.toml --dockerfile cyclec-cloud/Dockerfile
-  dockerfile = "cyclec-cloud/Dockerfile"
-
 [env]
   NODE_ENV = "production"
   PORT = "3000"

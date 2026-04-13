@@ -160,6 +160,8 @@ export async function refreshLinearToken(userId) {
 export function requireAuth(req, res, next) {
   // Skip auth endpoints
   if (req.path.startsWith("/auth/")) return next();
+  // Skip webhook endpoints (called by Linear, not users)
+  if (req.path.startsWith("/api/webhooks/")) return next();
   // Skip static files
   if (!req.path.startsWith("/api/")) return next();
 

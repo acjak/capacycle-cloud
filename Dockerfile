@@ -13,14 +13,14 @@ WORKDIR /app
 # Install cyclec core
 COPY cyclec/package.json cyclec/package-lock.json* ./cyclec/
 WORKDIR /app/cyclec
-RUN npm ci --production
-COPY cyclec/server.js cyclec/db.js ./
+RUN npm ci --omit=dev
+COPY cyclec/server.js cyclec/db.js cyclec/linear-cache.js ./
 COPY --from=frontend-build /app/cyclec/frontend/dist ./frontend/dist
 
-# Install cloud layer
+# Install cloud layer (needs cyclec core to already exist for the file: dependency)
 WORKDIR /app/cloud
 COPY cyclec-cloud/package.json cyclec-cloud/package-lock.json* ./
-RUN npm ci --production
+RUN npm ci --omit=dev
 COPY cyclec-cloud/ ./
 
 ENV NODE_ENV=production

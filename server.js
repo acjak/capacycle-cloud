@@ -44,6 +44,9 @@ const { server, app } = createApp({
 
   // Add auth and billing middleware before routes
   beforeRoutes: (app) => {
+    // Trust fly.io reverse proxy (needed for secure cookies behind SSL termination)
+    app.set("trust proxy", 1);
+
     // Security headers
     app.use(helmet({
       contentSecurityPolicy: {
