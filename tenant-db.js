@@ -31,13 +31,16 @@ export async function migrate() {
 
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-      tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       stripe_customer_id TEXT,
       stripe_subscription_id TEXT,
+      plan TEXT,
+      team_id TEXT,
       status TEXT NOT NULL DEFAULT 'trialing',
       trial_ends_at TIMESTAMPTZ DEFAULT (now() + interval '14 days'),
       current_period_end TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(tenant_id, team_id)
     );
 
     CREATE TABLE IF NOT EXISTS boards (
@@ -96,6 +99,9 @@ export async function migrate() {
       PRIMARY KEY ("sid")
     );
     CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
+
+    -- Add settings column to tenants if missing
+    ALTER TABLE tenants ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb;
   `);
 }
 
@@ -122,6 +128,18 @@ export async function findOrCreateTenant(linearOrgId, name) {
 export async function getTenant(id) {
   const result = await pool.query("SELECT * FROM tenants WHERE id = $1", [id]);
   return result.rows[0] || null;
+}
+
+export async function getTenantSettings(tenantId) {
+  const result = await pool.query("SELECT settings FROM tenants WHERE id = $1", [tenantId]);
+  return result.rows[0]?.settings || {};
+}
+
+export async function updateTenantSettings(tenantId, settings) {
+  await pool.query(
+    "UPDATE tenants SET settings = settings || $2::jsonb WHERE id = $1",
+    [tenantId, JSON.stringify(settings)]
+  );
 }
 
 // --- User operations ---
@@ -155,14 +173,55 @@ export async function getUser(id) {
 
 // --- Subscription operations ---
 
-export async function getSubscription(tenantId) {
+// Get all subscriptions for a tenant
+export async function getSubscriptions(tenantId) {
   const result = await pool.query(
     "SELECT * FROM subscriptions WHERE tenant_id = $1", [tenantId]
+  );
+  return result.rows;
+}
+
+// Get the "primary" subscription — org plan, or active trial, or first active
+export async function getSubscription(tenantId) {
+  const result = await pool.query(
+    "SELECT * FROM subscriptions WHERE tenant_id = $1 ORDER BY CASE WHEN team_id IS NULL THEN 0 ELSE 1 END, created_at LIMIT 1",
+    [tenantId]
   );
   return result.rows[0] || null;
 }
 
-export async function updateSubscription(tenantId, fields) {
+// Check if tenant has access to a specific team
+export async function hasTeamAccess(tenantId, teamId) {
+  const subs = await getSubscriptions(tenantId);
+  const now = new Date();
+  for (const sub of subs) {
+    const active = sub.status === "active" ||
+      (sub.status === "trialing" && new Date(sub.trial_ends_at) > now);
+    if (!active) continue;
+    // Org plan or trial (no team_id) covers all teams
+    if (!sub.team_id) return true;
+    // Team plan covers specific team
+    if (sub.team_id === teamId) return true;
+  }
+  return false;
+}
+
+// Get list of team IDs this tenant has access to (null = all teams)
+export async function getAccessibleTeams(tenantId) {
+  const subs = await getSubscriptions(tenantId);
+  const now = new Date();
+  const teamIds = [];
+  for (const sub of subs) {
+    const active = sub.status === "active" ||
+      (sub.status === "trialing" && new Date(sub.trial_ends_at) > now);
+    if (!active) continue;
+    if (!sub.team_id) return null; // org plan or trial = all teams
+    teamIds.push(sub.team_id);
+  }
+  return teamIds.length > 0 ? teamIds : [];
+}
+
+export async function updateSubscription(tenantId, fields, teamId = undefined) {
   const sets = [];
   const vals = [tenantId];
   let i = 2;
@@ -171,8 +230,12 @@ export async function updateSubscription(tenantId, fields) {
     vals.push(val);
     i++;
   }
+  const teamCondition = teamId === undefined
+    ? "" : teamId === null
+    ? " AND team_id IS NULL" : ` AND team_id = $${i}`;
+  if (teamId !== undefined && teamId !== null) vals.push(teamId);
   await pool.query(
-    `UPDATE subscriptions SET ${sets.join(", ")} WHERE tenant_id = $1`,
+    `UPDATE subscriptions SET ${sets.join(", ")} WHERE tenant_id = $1${teamCondition}`,
     vals
   );
 }

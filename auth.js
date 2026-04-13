@@ -119,6 +119,8 @@ router.get("/auth/me", async (req, res) => {
   if (!user) {
     return res.json({ user: null });
   }
+  let settings = {};
+  try { settings = await tenantDb.getTenantSettings(req.session.tenantId); } catch {}
   res.json({
     user: {
       id: user.id,
@@ -127,6 +129,7 @@ router.get("/auth/me", async (req, res) => {
       avatarUrl: user.avatar_url,
       role: user.role,
     },
+    settings,
   });
 });
 
@@ -160,8 +163,9 @@ export async function refreshLinearToken(userId) {
 export function requireAuth(req, res, next) {
   // Skip auth endpoints
   if (req.path.startsWith("/auth/")) return next();
-  // Skip webhook endpoints (called by Linear, not users)
+  // Skip webhook endpoints (called by Linear/Stripe, not users)
   if (req.path.startsWith("/api/webhooks/")) return next();
+  if (req.path === "/api/billing/webhook") return next();
   // Skip static files
   if (!req.path.startsWith("/api/")) return next();
 
