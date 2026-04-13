@@ -23,6 +23,8 @@ export async function migrate() {
       email TEXT,
       avatar_url TEXT,
       linear_access_token TEXT NOT NULL,
+      linear_refresh_token TEXT,
+      role TEXT NOT NULL DEFAULT 'member',
       created_at TIMESTAMPTZ DEFAULT now(),
       UNIQUE(tenant_id, linear_user_id)
     );
@@ -86,6 +88,14 @@ export async function migrate() {
       data JSONB NOT NULL DEFAULT '{}'::jsonb,
       PRIMARY KEY (tenant_id, team_id, cycle_id)
     );
+
+    CREATE TABLE IF NOT EXISTS "session" (
+      "sid" VARCHAR NOT NULL COLLATE "default",
+      "sess" JSON NOT NULL,
+      "expire" TIMESTAMP(6) NOT NULL,
+      PRIMARY KEY ("sid")
+    );
+    CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
   `);
 }
 
@@ -95,7 +105,7 @@ export async function findOrCreateTenant(linearOrgId, name) {
   const existing = await pool.query(
     "SELECT * FROM tenants WHERE linear_org_id = $1", [linearOrgId]
   );
-  if (existing.rows[0]) return existing.rows[0];
+  if (existing.rows[0]) return { ...existing.rows[0], isNew: false };
 
   const result = await pool.query(
     "INSERT INTO tenants (linear_org_id, name) VALUES ($1, $2) RETURNING *",
@@ -106,7 +116,7 @@ export async function findOrCreateTenant(linearOrgId, name) {
     "INSERT INTO subscriptions (tenant_id) VALUES ($1)",
     [result.rows[0].id]
   );
-  return result.rows[0];
+  return { ...result.rows[0], isNew: true };
 }
 
 export async function getTenant(id) {
@@ -116,18 +126,26 @@ export async function getTenant(id) {
 
 // --- User operations ---
 
-export async function upsertUser(tenantId, { linearUserId, name, email, avatarUrl, accessToken }) {
+export async function upsertUser(tenantId, { linearUserId, name, email, avatarUrl, accessToken, refreshToken, role = "member" }) {
   const result = await pool.query(`
-    INSERT INTO users (tenant_id, linear_user_id, name, email, avatar_url, linear_access_token)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO users (tenant_id, linear_user_id, name, email, avatar_url, linear_access_token, linear_refresh_token, role)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT (tenant_id, linear_user_id) DO UPDATE SET
       name = EXCLUDED.name,
       email = EXCLUDED.email,
       avatar_url = EXCLUDED.avatar_url,
-      linear_access_token = EXCLUDED.linear_access_token
+      linear_access_token = EXCLUDED.linear_access_token,
+      linear_refresh_token = COALESCE(EXCLUDED.linear_refresh_token, users.linear_refresh_token)
     RETURNING *
-  `, [tenantId, linearUserId, name, email, avatarUrl, accessToken]);
+  `, [tenantId, linearUserId, name, email, avatarUrl, accessToken, refreshToken, role]);
   return result.rows[0];
+}
+
+export async function updateUserTokens(userId, accessToken, refreshToken) {
+  await pool.query(
+    "UPDATE users SET linear_access_token = $1, linear_refresh_token = $2 WHERE id = $3",
+    [accessToken, refreshToken, userId]
+  );
 }
 
 export async function getUser(id) {
@@ -174,7 +192,7 @@ export async function getOrCreateBoard(tenantId, teamId, cycleId, preset = "retr
   );
   const board = result.rows[0];
 
-  const { PRESETS } = await import("headroom/db");
+  const { PRESETS } = await import("cyclec/db");
   const cols = PRESETS[preset] || PRESETS.custom;
   for (const col of cols) {
     await pool.query(

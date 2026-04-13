@@ -1,10 +1,15 @@
 import "dotenv/config";
 import session from "express-session";
+import connectPgSimple from "connect-pg-simple";
 import cookieParser from "cookie-parser";
-import { createApp } from "headroom";
-import authRouter, { requireAuth } from "./auth.js";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { createApp } from "cyclec";
+import authRouter, { requireAuth, refreshLinearToken } from "./auth.js";
 import billingRouter, { requireActiveSubscription } from "./billing.js";
 import * as tenantDb from "./tenant-db.js";
+
+const PgSession = connectPgSimple(session);
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET;
@@ -22,17 +27,61 @@ const { server, app } = createApp({
   // No static API key — each request uses the user's OAuth token
   linearApiKey: null,
 
-  // Per-tenant API key resolution from session
+  // Per-tenant API key resolution from session, with auto-refresh
   getApiKeyForRequest: async (req) => {
     if (!req.session?.userId) return null;
     const user = await tenantDb.getUser(req.session.userId);
-    return user ? `Bearer ${user.linear_access_token}` : null;
+    if (!user) return null;
+    return `Bearer ${user.linear_access_token}`;
+  },
+
+  // Called when Linear returns 401 — try refreshing the token
+  onLinearAuthError: async (req) => {
+    if (!req.session?.userId) return null;
+    const newToken = await refreshLinearToken(req.session.userId);
+    return newToken ? `Bearer ${newToken}` : null;
   },
 
   // Add auth and billing middleware before routes
   beforeRoutes: (app) => {
+    // Security headers
+    app.use(helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+          fontSrc: ["'self'", "https://fonts.gstatic.com"],
+          imgSrc: ["'self'", "data:", "https:"],
+          connectSrc: ["'self'", "ws:", "wss:"],
+          upgradeInsecureRequests: process.env.NODE_ENV === "production" ? [] : null,
+        },
+      },
+    }));
+
+    // Rate limiting on auth endpoints
+    app.use("/auth/", rateLimit({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      max: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+    }));
+
+    // Rate limiting on billing endpoints
+    app.use("/api/billing/", rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+      standardHeaders: true,
+      legacyHeaders: false,
+    }));
+
     app.use(cookieParser());
     app.use(session({
+      store: new PgSession({
+        pool: tenantDb.pool,
+        tableName: "session",
+        createTableIfMissing: false, // handled by migrate()
+      }),
       secret: SESSION_SECRET,
       resave: false,
       saveUninitialized: false,
@@ -57,6 +106,10 @@ const { server, app } = createApp({
   },
 });
 
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
+
 server.listen(PORT, () => {
-  console.log(`Headroom Cloud running on http://localhost:${PORT}`);
+  console.log(`Capacycle Cloud running on http://localhost:${PORT}`);
 });

@@ -12,8 +12,17 @@ const {
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 const router = express.Router();
 
+// Only tenant owners can manage billing
+async function requireOwner(req, res, next) {
+  const user = await tenantDb.getUser(req.session.userId);
+  if (!user || user.role !== "owner") {
+    return res.status(403).json({ error: "Only the workspace owner can manage billing" });
+  }
+  next();
+}
+
 // Create checkout session
-router.post("/api/billing/checkout", async (req, res) => {
+router.post("/api/billing/checkout", requireOwner, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Billing not configured" });
 
   const tenantId = req.session.tenantId;
@@ -42,7 +51,7 @@ router.post("/api/billing/checkout", async (req, res) => {
 });
 
 // Billing portal
-router.post("/api/billing/portal", async (req, res) => {
+router.post("/api/billing/portal", requireOwner, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Billing not configured" });
 
   const sub = await tenantDb.getSubscription(req.session.tenantId);

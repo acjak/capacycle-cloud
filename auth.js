@@ -57,7 +57,8 @@ router.get("/auth/callback", async (req, res) => {
       return res.status(400).send("Failed to authenticate with Linear");
     }
 
-    const { access_token } = await tokenRes.json();
+    const tokenData = await tokenRes.json();
+    const { access_token, refresh_token } = tokenData;
 
     // Fetch user and org info from Linear
     const userRes = await fetch("https://api.linear.app/graphql", {
@@ -88,6 +89,8 @@ router.get("/auth/callback", async (req, res) => {
       email: viewer.email,
       avatarUrl: viewer.avatarUrl,
       accessToken: access_token,
+      refreshToken: refresh_token || null,
+      role: tenant.isNew ? "owner" : "member",
     });
 
     // Store in session
@@ -122,9 +125,36 @@ router.get("/auth/me", async (req, res) => {
       name: user.name,
       email: user.email,
       avatarUrl: user.avatar_url,
+      role: user.role,
     },
   });
 });
+
+// Refresh an expired Linear OAuth token
+export async function refreshLinearToken(userId) {
+  const user = await tenantDb.getUser(userId);
+  if (!user?.linear_refresh_token) return null;
+
+  const tokenRes = await fetch("https://api.linear.app/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: user.linear_refresh_token,
+      client_id: LINEAR_CLIENT_ID,
+      client_secret: LINEAR_CLIENT_SECRET,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    console.error("Token refresh failed:", await tokenRes.text());
+    return null;
+  }
+
+  const { access_token, refresh_token } = await tokenRes.json();
+  await tenantDb.updateUserTokens(userId, access_token, refresh_token || user.linear_refresh_token);
+  return access_token;
+}
 
 // Middleware: require auth on /api/* routes
 export function requireAuth(req, res, next) {

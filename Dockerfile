@@ -1,21 +1,27 @@
+FROM node:20-slim AS frontend-build
+
+WORKDIR /app/cyclec/frontend
+COPY cyclec/frontend/package.json cyclec/frontend/package-lock.json* ./
+RUN npm ci
+COPY cyclec/frontend/ ./
+RUN npm run build
+
 FROM node:20-slim
 
 WORKDIR /app
 
-# Copy open source core
-COPY linear-dashboard/ ./linear-dashboard/
+# Install cyclec core
+COPY cyclec/package.json cyclec/package-lock.json* ./cyclec/
+WORKDIR /app/cyclec
+RUN npm ci --production
+COPY cyclec/server.js cyclec/db.js ./
+COPY --from=frontend-build /app/cyclec/frontend/dist ./frontend/dist
 
-# Install core dependencies + build frontend
-WORKDIR /app/linear-dashboard
-RUN npm ci
-RUN cd frontend && npm ci && npm run build
-
-# Copy cloud wrapper
+# Install cloud layer
 WORKDIR /app/cloud
-COPY headroom-cloud/package.json headroom-cloud/package-lock.json* ./
-RUN npm ci
-
-COPY headroom-cloud/ ./
+COPY cyclec-cloud/package.json cyclec-cloud/package-lock.json* ./
+RUN npm ci --production
+COPY cyclec-cloud/ ./
 
 ENV NODE_ENV=production
 ENV PORT=3000

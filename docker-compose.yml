@@ -1,4 +1,25 @@
 services:
+  app:
+    build:
+      context: ..
+      dockerfile: cyclec-cloud/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://headroom:headroom@db:5432/headroom
+      - SESSION_SECRET=${SESSION_SECRET}
+      - LINEAR_CLIENT_ID=${LINEAR_CLIENT_ID}
+      - LINEAR_CLIENT_SECRET=${LINEAR_CLIENT_SECRET}
+      - LINEAR_REDIRECT_URI=${LINEAR_REDIRECT_URI}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - STRIPE_PRICE_ID=${STRIPE_PRICE_ID}
+      - APP_URL=${APP_URL:-http://localhost:3000}
+      - NODE_ENV=production
+    depends_on:
+      - db
+    restart: unless-stopped
+
   db:
     image: postgres:16-alpine
     environment:
@@ -9,6 +30,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
 
 volumes:
   pgdata:
