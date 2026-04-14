@@ -73,16 +73,17 @@ const { server, app, io } = createApp({
   linearWebhookSecret: process.env.LINEAR_WEBHOOK_SECRET || null,
 
   // Cloud-aware Linear webhook handler: resolve tenant from org ID, scope emit to tenant
-  onLinearWebhook: async ({ type, action, eventData, io: ioRef }) => {
-    // Linear webhooks include organizationId in the payload
-    const orgId = eventData?.organizationId;
+  onLinearWebhook: async ({ type, action, eventData, payload, io: ioRef }) => {
+    // Linear may put organizationId on the top-level payload or inside data
+    const orgId = payload?.organizationId || eventData?.organizationId;
     if (!orgId) return;
     const { rows } = await tenantDb.pool.query(
       "SELECT id FROM tenants WHERE linear_org_id = $1", [orgId]
     );
     const tenantId = rows[0]?.id;
     if (!tenantId) return;
-    // Emit only to sockets of this tenant
+    // Emit only to sockets of this tenant — frontend refetches team data and issues,
+    // which updates burndown, velocity, capacity, insights, and forecasting views
     ioRef.to(`tenant:${tenantId}`).emit("data-updated", { type, action });
   },
 
