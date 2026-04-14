@@ -221,11 +221,20 @@ export async function getAccessibleTeams(tenantId) {
   return teamIds.length > 0 ? teamIds : [];
 }
 
+// Allowlist for updateSubscription field names — prevents SQL injection if this ever gets user-controlled input
+const SUBSCRIPTION_FIELDS = new Set([
+  "status", "plan", "stripe_customer_id", "stripe_subscription_id",
+  "current_period_end", "trial_ends_at", "team_id",
+]);
+
 export async function updateSubscription(tenantId, fields, teamId = undefined) {
   const sets = [];
   const vals = [tenantId];
   let i = 2;
   for (const [key, val] of Object.entries(fields)) {
+    if (!SUBSCRIPTION_FIELDS.has(key)) {
+      throw new Error(`updateSubscription: field "${key}" not in allowlist`);
+    }
     sets.push(`${key} = $${i}`);
     vals.push(val);
     i++;
@@ -241,6 +250,34 @@ export async function updateSubscription(tenantId, fields, teamId = undefined) {
 }
 
 // --- Board operations (tenant-scoped, Postgres-backed) ---
+
+// Ownership checks — throw if the resource doesn't belong to the tenant
+export async function assertBoardAccess(tenantId, boardId) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM boards WHERE id = $1 AND tenant_id = $2", [boardId, tenantId]
+  );
+  if (!rows[0]) throw new Error("Forbidden: board not in tenant");
+}
+
+export async function assertColumnAccess(tenantId, columnId) {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM board_columns bc
+     JOIN boards b ON b.id = bc.board_id
+     WHERE bc.id = $1 AND b.tenant_id = $2`,
+    [columnId, tenantId]
+  );
+  if (!rows[0]) throw new Error("Forbidden: column not in tenant");
+}
+
+export async function assertCardAccess(tenantId, cardId) {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM cards c
+     JOIN boards b ON b.id = c.board_id
+     WHERE c.id = $1 AND b.tenant_id = $2`,
+    [cardId, tenantId]
+  );
+  if (!rows[0]) throw new Error("Forbidden: card not in tenant");
+}
 
 export async function getOrCreateBoard(tenantId, teamId, cycleId, preset = "retrospective") {
   const existing = await pool.query(

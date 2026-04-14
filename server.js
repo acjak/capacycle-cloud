@@ -9,6 +9,7 @@ import { createApp } from "cyclec";
 import authRouter, { requireAuth, refreshLinearToken } from "./auth.js";
 import billingRouter, { requireActiveSubscription } from "./billing.js";
 import * as tenantDb from "./tenant-db.js";
+import { notifyError } from "./notify.js";
 
 const PgSession = connectPgSimple(session);
 
@@ -23,12 +24,35 @@ if (!SESSION_SECRET) {
 // Initialize database
 await tenantDb.migrate();
 
-// Create headroom app with cloud overrides
-const { server, app } = createApp({
-  // No static API key — each request uses the user's OAuth token
+// Build session middleware once so both Express and Socket.io can use it.
+const sessionMiddleware = session({
+  store: new PgSession({
+    pool: tenantDb.pool,
+    tableName: "session",
+    createTableIfMissing: false,
+  }),
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === "production",
+    httpOnly: true,
+    // "lax" allows the cookie on top-level navigations (needed for Linear OAuth callback)
+    // while blocking it on cross-site subresource requests, which covers the CSRF risk.
+    sameSite: "lax",
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  },
+});
+
+// Input validation helpers
+const isValidId = (s) => typeof s === "string" && s.length > 0 && s.length <= 200;
+const clampString = (s, max) => (typeof s === "string" ? s.slice(0, max) : "");
+
+// Create cyclec app, skipping its built-in board/availability/actual-hours routes
+// and socket handlers. Cloud mounts tenant-aware versions via afterRoutes.
+const { server, app, io } = createApp({
   linearApiKey: null,
 
-  // Per-tenant API key resolution from session, with auto-refresh
   getApiKeyForRequest: async (req) => {
     if (!req.session?.userId) return null;
     const user = await tenantDb.getUser(req.session.userId);
@@ -36,27 +60,42 @@ const { server, app } = createApp({
     return `Bearer ${user.linear_access_token}`;
   },
 
-  // Called when Linear returns 401 — try refreshing the token
   onLinearAuthError: async (req) => {
     if (!req.session?.userId) return null;
     const newToken = await refreshLinearToken(req.session.userId);
     return newToken ? `Bearer ${newToken}` : null;
   },
 
-  // Add auth and billing middleware before routes
-  beforeRoutes: (app) => {
-    // Trust fly.io reverse proxy (needed for secure cookies behind SSL termination)
-    app.set("trust proxy", 1);
+  // Skip single-tenant routes and socket handlers; cloud mounts its own below.
+  skipBoardRoutes: true,
+  skipSocketHandlers: true,
 
-    // Cookie parser (needed early for access gate)
+  linearWebhookSecret: process.env.LINEAR_WEBHOOK_SECRET || null,
+
+  // Cloud-aware Linear webhook handler: resolve tenant from org ID, scope emit to tenant
+  onLinearWebhook: async ({ type, action, eventData, io: ioRef }) => {
+    // Linear webhooks include organizationId in the payload
+    const orgId = eventData?.organizationId;
+    if (!orgId) return;
+    const { rows } = await tenantDb.pool.query(
+      "SELECT id FROM tenants WHERE linear_org_id = $1", [orgId]
+    );
+    const tenantId = rows[0]?.id;
+    if (!tenantId) return;
+    // Emit only to sockets of this tenant
+    ioRef.to(`tenant:${tenantId}`).emit("data-updated", { type, action });
+  },
+
+  beforeRoutes: (app) => {
+    app.set("trust proxy", 1);
     app.use(cookieParser());
 
-    // Access gate — set LAUNCH_CODE env var to enable (remove to open to public)
+    // Access gate — set LAUNCH_CODE env var to enable
     const launchCode = process.env.LAUNCH_CODE;
     if (launchCode) {
       app.post("/gate", express.urlencoded({ extended: false }), (req, res) => {
         if (req.body.code === launchCode) {
-          res.cookie("gate", launchCode, { maxAge: 30 * 24 * 60 * 60 * 1000, httpOnly: true, secure: process.env.NODE_ENV === "production" });
+          res.cookie("gate", launchCode, { maxAge: 30 * 24 * 60 * 60 * 1000, httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax" });
           res.redirect("/");
         } else {
           res.send(gatePage("Wrong code"));
@@ -64,7 +103,6 @@ const { server, app } = createApp({
       });
       app.use((req, res, next) => {
         if (req.path === "/gate" || req.path.startsWith("/api/webhooks/") || req.path === "/api/billing/webhook") return next();
-        // Allow crawlers to access SEO files
         if (req.path === "/robots.txt" || req.path === "/sitemap.xml") return next();
         if (req.cookies?.gate === launchCode) return next();
         res.send(gatePage());
@@ -85,7 +123,6 @@ ${error ? `<div class="err">${error}</div>` : ""}
 <button type="submit">Enter</button></form></div></body></html>`;
     }
 
-    // Security headers
     app.use(helmet({
       contentSecurityPolicy: {
         directives: {
@@ -100,15 +137,13 @@ ${error ? `<div class="err">${error}</div>` : ""}
       },
     }));
 
-    // Rate limiting on auth endpoints
     app.use("/auth/", rateLimit({
-      windowMs: 15 * 60 * 1000, // 15 minutes
+      windowMs: 15 * 60 * 1000,
       max: 30,
       standardHeaders: true,
       legacyHeaders: false,
     }));
 
-    // Rate limiting on billing endpoints
     app.use("/api/billing/", rateLimit({
       windowMs: 15 * 60 * 1000,
       max: 20,
@@ -116,32 +151,13 @@ ${error ? `<div class="err">${error}</div>` : ""}
       legacyHeaders: false,
     }));
 
-    app.use(session({
-      store: new PgSession({
-        pool: tenantDb.pool,
-        tableName: "session",
-        createTableIfMissing: false, // handled by migrate()
-      }),
-      secret: SESSION_SECRET,
-      resave: false,
-      saveUninitialized: false,
-      cookie: {
-        secure: process.env.NODE_ENV === "production",
-        httpOnly: true,
-        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-      },
-    }));
+    app.use(sessionMiddleware);
 
-    // Auth routes (login, callback, logout, me)
     app.use(authRouter);
-
-    // Require auth on API routes
     app.use(requireAuth);
-
-    // Billing routes (checkout, portal, status, webhook)
     app.use(billingRouter);
 
-    // Tenant settings routes (after auth, before subscription check so settings are always accessible)
+    // Tenant settings (before subscription check so settings stay accessible)
     app.get("/api/settings", async (req, res) => {
       try {
         const settings = await tenantDb.getTenantSettings(req.session.tenantId);
@@ -165,12 +181,238 @@ ${error ? `<div class="err">${error}</div>` : ""}
       }
     });
 
-    // Require active subscription for API access
     app.use(requireActiveSubscription);
   },
-});
 
-import { notifyError } from "./notify.js";
+  // All tenant-aware board/availability/actual-hours routes go here
+  afterRoutes: ({ app, io }) => {
+    // --- Board REST (initial load) ---
+    app.get("/api/board/:teamId/:cycleId", async (req, res) => {
+      try {
+        const { teamId, cycleId } = req.params;
+        if (!isValidId(teamId) || !isValidId(cycleId)) {
+          return res.status(400).json({ error: "Invalid teamId or cycleId" });
+        }
+        // voterId derived from session userId (not client-controlled)
+        const voterId = req.session.userId;
+        const board = await tenantDb.getFullBoard(req.session.tenantId, teamId, cycleId, voterId);
+        res.json(board);
+      } catch (err) {
+        console.error("Board error:", err.message);
+        res.status(500).json({ error: "Failed to load board" });
+      }
+    });
+
+    // --- Availability ---
+    app.get("/api/availability/:teamId/:cycleId", async (req, res) => {
+      try {
+        const { teamId, cycleId } = req.params;
+        if (!isValidId(teamId) || !isValidId(cycleId)) {
+          return res.status(400).json({ error: "Invalid teamId or cycleId" });
+        }
+        const data = await tenantDb.getAvailability(req.session.tenantId, teamId, cycleId);
+        res.json(data);
+      } catch (err) {
+        res.status(500).json({ error: "Failed to load availability" });
+      }
+    });
+
+    app.put("/api/availability/:teamId/:cycleId", express.json({ limit: "50kb" }), async (req, res) => {
+      try {
+        const { teamId, cycleId } = req.params;
+        if (!isValidId(teamId) || !isValidId(cycleId)) {
+          return res.status(400).json({ error: "Invalid teamId or cycleId" });
+        }
+        if (!req.body || typeof req.body !== "object") {
+          return res.status(400).json({ error: "Invalid body" });
+        }
+        await tenantDb.setAvailability(req.session.tenantId, teamId, cycleId, req.body);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to save availability" });
+      }
+    });
+
+    // --- Actual hours ---
+    app.post("/api/actual-hours", express.json(), async (req, res) => {
+      try {
+        const { issueIds } = req.body;
+        if (!Array.isArray(issueIds)) {
+          return res.status(400).json({ error: "issueIds must be an array" });
+        }
+        if (issueIds.some((id) => !isValidId(id))) {
+          return res.status(400).json({ error: "Invalid issue id" });
+        }
+        const hours = await tenantDb.getActualHours(req.session.tenantId, issueIds);
+        res.json(hours);
+      } catch (err) {
+        res.status(500).json({ error: "Failed to fetch hours" });
+      }
+    });
+
+    app.put("/api/actual-hours/:issueId", express.json(), async (req, res) => {
+      try {
+        if (!isValidId(req.params.issueId)) {
+          return res.status(400).json({ error: "Invalid issueId" });
+        }
+        const hours = parseFloat(req.body.hours);
+        if (isNaN(hours) || hours < 0 || hours > 10000) {
+          return res.status(400).json({ error: "Invalid hours value" });
+        }
+        await tenantDb.setActualHours(req.session.tenantId, req.params.issueId, hours);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to save hours" });
+      }
+    });
+
+    // --- Socket.io with auth and tenant isolation ---
+
+    // Attach session to socket so we can read userId/tenantId
+    io.engine.use((req, res, next) => {
+      sessionMiddleware(req, res, next);
+    });
+
+    // Reject unauthenticated sockets
+    io.use((socket, next) => {
+      const session = socket.request.session;
+      if (!session?.userId || !session?.tenantId) {
+        return next(new Error("Unauthorized"));
+      }
+      socket.userId = session.userId;
+      socket.tenantId = session.tenantId;
+      next();
+    });
+
+    io.on("connection", (socket) => {
+      let currentRoom = null;
+      const voterId = socket.userId; // derived from session, not client-controlled
+      const tenantId = socket.tenantId;
+
+      // Always join the tenant-wide room for data-updated events
+      socket.join(`tenant:${tenantId}`);
+
+      socket.on("join-board", async ({ teamId, cycleId }) => {
+        try {
+          if (!isValidId(teamId) || !isValidId(cycleId)) return;
+          if (currentRoom) socket.leave(currentRoom);
+          // Scope rooms by tenant so cross-tenant clients can't join the same logical room
+          currentRoom = `board:${tenantId}:${teamId}:${cycleId}`;
+          socket.join(currentRoom);
+          socket.teamId = teamId;
+          socket.cycleId = cycleId;
+        } catch (err) {
+          socket.emit("error", { message: "Failed to join board" });
+        }
+      });
+
+      socket.on("add-card", async ({ columnId, boardId, text }) => {
+        try {
+          if (!isValidId(columnId) || !isValidId(boardId)) return;
+          await tenantDb.assertBoardAccess(tenantId, boardId);
+          await tenantDb.assertColumnAccess(tenantId, columnId);
+          const card = await tenantDb.addCard(columnId, boardId, clampString(text, 10000));
+          if (currentRoom) io.to(currentRoom).emit("card-added", card);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("update-card", async ({ cardId, text }) => {
+        try {
+          if (!isValidId(cardId)) return;
+          await tenantDb.assertCardAccess(tenantId, cardId);
+          const card = await tenantDb.updateCard(cardId, clampString(text, 10000));
+          if (currentRoom) io.to(currentRoom).emit("card-updated", card);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("move-card", async ({ cardId, newColumnId, newPosition }) => {
+        try {
+          if (!isValidId(cardId) || !isValidId(newColumnId)) return;
+          if (typeof newPosition !== "number") return;
+          await tenantDb.assertCardAccess(tenantId, cardId);
+          await tenantDb.assertColumnAccess(tenantId, newColumnId);
+          const card = await tenantDb.moveCard(cardId, newColumnId, newPosition);
+          if (currentRoom) io.to(currentRoom).emit("card-moved", card);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("delete-card", async ({ cardId }) => {
+        try {
+          if (!isValidId(cardId)) return;
+          await tenantDb.assertCardAccess(tenantId, cardId);
+          await tenantDb.deleteCard(cardId);
+          if (currentRoom) io.to(currentRoom).emit("card-deleted", { cardId });
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("toggle-vote", async ({ cardId }) => {
+        try {
+          if (!isValidId(cardId)) return;
+          await tenantDb.assertCardAccess(tenantId, cardId);
+          // voterId is always the session userId, never client-supplied
+          const result = await tenantDb.toggleVote(cardId, voterId);
+          if (currentRoom) io.to(currentRoom).emit("vote-updated", { ...result, voterId });
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("add-column", async ({ boardId, title, color }) => {
+        try {
+          if (!isValidId(boardId)) return;
+          await tenantDb.assertBoardAccess(tenantId, boardId);
+          const col = await tenantDb.addColumn(boardId, clampString(title, 500), clampString(color, 50) || null);
+          if (currentRoom) io.to(currentRoom).emit("column-added", col);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("update-column", async ({ columnId, title, position, color }) => {
+        try {
+          if (!isValidId(columnId)) return;
+          if (typeof position !== "number") return;
+          await tenantDb.assertColumnAccess(tenantId, columnId);
+          const col = await tenantDb.updateColumn(columnId, clampString(title, 500), position, clampString(color, 50) || null);
+          if (currentRoom) io.to(currentRoom).emit("column-updated", col);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("delete-column", async ({ columnId }) => {
+        try {
+          if (!isValidId(columnId)) return;
+          await tenantDb.assertColumnAccess(tenantId, columnId);
+          await tenantDb.deleteColumn(columnId);
+          if (currentRoom) io.to(currentRoom).emit("column-deleted", { columnId });
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+
+      socket.on("reset-board", async ({ teamId, cycleId, preset }) => {
+        try {
+          if (!isValidId(teamId) || !isValidId(cycleId)) return;
+          const safePreset = ["retrospective", "planning", "custom"].includes(preset) ? preset : "custom";
+          await tenantDb.resetBoard(tenantId, teamId, cycleId, safePreset);
+          const board = await tenantDb.getFullBoard(tenantId, teamId, cycleId, voterId);
+          if (currentRoom) io.to(currentRoom).emit("board-reset", board);
+        } catch (err) {
+          socket.emit("error", { message: err.message });
+        }
+      });
+    });
+  },
+});
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", err);
