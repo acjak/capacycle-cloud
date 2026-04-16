@@ -115,6 +115,14 @@ export async function migrate() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_reports_token ON reports(token);
+
+    CREATE TABLE IF NOT EXISTS action_item_resolutions (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      card_id TEXT NOT NULL,
+      resolved_in_cycle TEXT NOT NULL,
+      resolved BOOLEAN NOT NULL DEFAULT false,
+      PRIMARY KEY (tenant_id, card_id, resolved_in_cycle)
+    );
   `);
 }
 
@@ -474,6 +482,60 @@ export async function setAvailability(tenantId, teamId, cycleId, data) {
     INSERT INTO availability (tenant_id, team_id, cycle_id, data) VALUES ($1, $2, $3, $4)
     ON CONFLICT (tenant_id, team_id, cycle_id) DO UPDATE SET data = EXCLUDED.data
   `, [tenantId, teamId, cycleId, JSON.stringify(data)]);
+}
+
+// --- Action item follow-through ---
+
+export async function getPreviousActionItems(tenantId, teamId, previousCycleId, currentCycleId) {
+  // Find the retrospective board from the previous cycle
+  const boardResult = await pool.query(
+    "SELECT id FROM boards WHERE tenant_id = $1 AND team_id = $2 AND cycle_id = $3 AND preset = 'retrospective'",
+    [tenantId, teamId, previousCycleId]
+  );
+  if (!boardResult.rows[0]) return [];
+
+  const boardId = boardResult.rows[0].id;
+
+  // Find columns that look like "action items" (case-insensitive)
+  const colResult = await pool.query(
+    "SELECT id FROM board_columns WHERE board_id = $1 AND LOWER(title) LIKE '%action%'",
+    [boardId]
+  );
+  if (colResult.rows.length === 0) return [];
+
+  const colIds = colResult.rows.map((r) => r.id);
+
+  // Get cards from those columns
+  const cardsResult = await pool.query(
+    "SELECT id, text, created_at FROM cards WHERE column_id = ANY($1) ORDER BY position",
+    [colIds]
+  );
+
+  // Get resolution status for these cards in the current cycle
+  const cardIds = cardsResult.rows.map((r) => r.id);
+  const resResult = cardIds.length > 0
+    ? await pool.query(
+        "SELECT card_id, resolved FROM action_item_resolutions WHERE tenant_id = $1 AND card_id = ANY($2) AND resolved_in_cycle = $3",
+        [tenantId, cardIds, currentCycleId]
+      )
+    : { rows: [] };
+
+  const resMap = {};
+  resResult.rows.forEach((r) => { resMap[r.card_id] = r.resolved; });
+
+  return cardsResult.rows.map((card) => ({
+    id: card.id,
+    text: card.text,
+    resolved: resMap[card.id] || false,
+  }));
+}
+
+export async function resolveActionItem(tenantId, cardId, currentCycleId, resolved) {
+  await pool.query(`
+    INSERT INTO action_item_resolutions (tenant_id, card_id, resolved_in_cycle, resolved)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (tenant_id, card_id, resolved_in_cycle) DO UPDATE SET resolved = EXCLUDED.resolved
+  `, [tenantId, cardId, currentCycleId, resolved]);
 }
 
 // --- Reports ---

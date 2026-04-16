@@ -248,6 +248,40 @@ ${error ? `<div class="err">${error}</div>` : ""}
       }
     });
 
+    // --- Action item follow-through ---
+    app.get("/api/board/:teamId/:cycleId/previous-actions", async (req, res) => {
+      try {
+        const { teamId, cycleId } = req.params;
+        const previousCycleId = req.query.previousCycleId;
+        if (!isValidId(teamId) || !isValidId(cycleId) || !previousCycleId || !isValidId(previousCycleId)) {
+          return res.status(400).json({ error: "Invalid parameters" });
+        }
+        const items = await tenantDb.getPreviousActionItems(
+          req.session.tenantId, teamId, previousCycleId, cycleId
+        );
+        res.json(items);
+      } catch (err) {
+        console.error("Previous actions error:", err.message);
+        res.status(500).json({ error: "Failed to load action items" });
+      }
+    });
+
+    app.put("/api/action-items/:cardId/resolve", express.json(), async (req, res) => {
+      try {
+        const { cardId } = req.params;
+        const { cycleId, resolved } = req.body;
+        if (!isValidId(cardId) || !isValidId(cycleId)) {
+          return res.status(400).json({ error: "Invalid parameters" });
+        }
+        await tenantDb.resolveActionItem(
+          req.session.tenantId, cardId, cycleId, !!resolved
+        );
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to update action item" });
+      }
+    });
+
     // --- Board REST (initial load) ---
     app.get("/api/board/:teamId/:cycleId", async (req, res) => {
       try {
