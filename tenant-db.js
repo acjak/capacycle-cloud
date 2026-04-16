@@ -102,6 +102,19 @@ export async function migrate() {
 
     -- Add settings column to tenants if missing
     ALTER TABLE tenants ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      team_id TEXT NOT NULL,
+      cycle_id TEXT NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      snapshot JSONB NOT NULL,
+      note TEXT,
+      created_by TEXT REFERENCES users(id),
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_token ON reports(token);
   `);
 }
 
@@ -461,6 +474,36 @@ export async function setAvailability(tenantId, teamId, cycleId, data) {
     INSERT INTO availability (tenant_id, team_id, cycle_id, data) VALUES ($1, $2, $3, $4)
     ON CONFLICT (tenant_id, team_id, cycle_id) DO UPDATE SET data = EXCLUDED.data
   `, [tenantId, teamId, cycleId, JSON.stringify(data)]);
+}
+
+// --- Reports ---
+
+export async function createReport(tenantId, { teamId, cycleId, snapshot, note, createdBy }) {
+  const crypto = await import("crypto");
+  const token = crypto.randomBytes(24).toString("base64url");
+  const result = await pool.query(
+    `INSERT INTO reports (tenant_id, team_id, cycle_id, token, snapshot, note, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    [tenantId, teamId, cycleId, token, JSON.stringify(snapshot), note || null, createdBy]
+  );
+  return result.rows[0];
+}
+
+export async function getReportByToken(token) {
+  const result = await pool.query("SELECT * FROM reports WHERE token = $1", [token]);
+  return result.rows[0] || null;
+}
+
+export async function getReportsForCycle(tenantId, teamId, cycleId) {
+  const result = await pool.query(
+    "SELECT id, token, note, created_at, created_by FROM reports WHERE tenant_id = $1 AND team_id = $2 AND cycle_id = $3 ORDER BY created_at DESC",
+    [tenantId, teamId, cycleId]
+  );
+  return result.rows;
+}
+
+export async function deleteReport(tenantId, reportId) {
+  await pool.query("DELETE FROM reports WHERE id = $1 AND tenant_id = $2", [reportId, tenantId]);
 }
 
 export { pool };

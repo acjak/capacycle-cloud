@@ -104,7 +104,10 @@ const { server, app, io } = createApp({
       });
       app.use((req, res, next) => {
         if (req.path === "/gate" || req.path.startsWith("/api/webhooks/") || req.path === "/api/billing/webhook") return next();
+        if (req.path.startsWith("/api/report/") || req.path.startsWith("/report/")) return next();
         if (req.path === "/robots.txt" || req.path === "/sitemap.xml") return next();
+        // Allow static assets for report page rendering
+        if (req.path.match(/\.(js|css|svg|png|ico|woff2?)$/)) return next();
         if (req.cookies?.gate === launchCode) return next();
         res.send(gatePage());
       });
@@ -154,6 +157,21 @@ ${error ? `<div class="err">${error}</div>` : ""}
 
     app.use(sessionMiddleware);
 
+    // Public report view — no auth required, accessed via unique token
+    app.get("/api/report/:token", async (req, res) => {
+      try {
+        const report = await tenantDb.getReportByToken(req.params.token);
+        if (!report) return res.status(404).json({ error: "Report not found" });
+        res.json({
+          snapshot: report.snapshot,
+          note: report.note,
+          createdAt: report.created_at,
+        });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to load report" });
+      }
+    });
+
     app.use(authRouter);
     app.use(requireAuth);
     app.use(billingRouter);
@@ -185,8 +203,51 @@ ${error ? `<div class="err">${error}</div>` : ""}
     app.use(requireActiveSubscription);
   },
 
-  // All tenant-aware board/availability/actual-hours routes go here
+  // All tenant-aware board/availability/actual-hours/reports routes go here
   afterRoutes: ({ app, io }) => {
+    // --- Reports ---
+    app.post("/api/reports", express.json({ limit: "500kb" }), async (req, res) => {
+      try {
+        const { teamId, cycleId, snapshot, note } = req.body;
+        if (!isValidId(teamId) || !isValidId(cycleId)) {
+          return res.status(400).json({ error: "Invalid teamId or cycleId" });
+        }
+        if (!snapshot || typeof snapshot !== "object") {
+          return res.status(400).json({ error: "Invalid snapshot data" });
+        }
+        const report = await tenantDb.createReport(req.session.tenantId, {
+          teamId,
+          cycleId,
+          snapshot,
+          note: typeof note === "string" ? note.slice(0, 5000) : null,
+          createdBy: req.session.userId,
+        });
+        res.json({ id: report.id, token: report.token, createdAt: report.created_at });
+      } catch (err) {
+        console.error("Create report error:", err.message);
+        res.status(500).json({ error: "Failed to create report" });
+      }
+    });
+
+    app.get("/api/reports/:teamId/:cycleId", async (req, res) => {
+      try {
+        const { teamId, cycleId } = req.params;
+        const reports = await tenantDb.getReportsForCycle(req.session.tenantId, teamId, cycleId);
+        res.json(reports);
+      } catch (err) {
+        res.status(500).json({ error: "Failed to list reports" });
+      }
+    });
+
+    app.delete("/api/reports/:reportId", async (req, res) => {
+      try {
+        await tenantDb.deleteReport(req.session.tenantId, req.params.reportId);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to delete report" });
+      }
+    });
+
     // --- Board REST (initial load) ---
     app.get("/api/board/:teamId/:cycleId", async (req, res) => {
       try {
